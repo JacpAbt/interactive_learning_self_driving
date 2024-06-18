@@ -1,0 +1,17 @@
+carla
+openai
+numpy
+matplotlib
+Pillow
+requests
+pandas
+scikit-learn
+tensorflow
+stable-baselines3
+gym
+transformers
+
+datasets
+opencv-python
+open3d
+matplotlib
