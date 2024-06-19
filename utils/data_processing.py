@@ -1,21 +1,17 @@
-import pandas as pd
+import os
 import json
-import numpy as np
+from PIL import Image
 
-def log_decision(image, lidar_data, radar_data, gps_data, decision, log_path):
-    """Logs the decision with the corresponding sensor data."""
-    log_entry = {
-        'image': np.array(image).tolist(),
-        'lidar_data': lidar_data.tolist(),
-        'radar_data': radar_data.tolist(),
-        'gps_data': gps_data,
-        'decision': decision
-    }
+def save_image(image, path):
+    """Saves a numpy array as an image."""
+    image.save(path)
+
+def log_control_command(control_command, log_path):
+    """Log the control command to the specified log file."""
     with open(log_path, 'a') as log_file:
-        log_file.write(json.dumps(log_entry) + '\n')
+        log_file.write(control_command + '\n')
 
-def load_logs(log_path):
-    """Loads the log file into a DataFrame."""
-    with open(log_path, 'r') as log_file:
-        logs = [json.loads(line) for line in log_file]
-    return pd.DataFrame(logs)
+def ensure_dir(directory):
+    """Ensure that a directory exists."""
+    if not os.path.exists(directory):
+        os.makedirs(directory)
