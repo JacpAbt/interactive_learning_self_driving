@@ -17,6 +17,8 @@ import random
 from dotenv import load_dotenv
 import logging
 import signal
+import psutil
+import GPUtil
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -32,6 +34,13 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+def log_resource_usage():
+    cpu_percent = psutil.cpu_percent()
+    memory_percent = psutil.virtual_memory().percent
+    gpus = GPUtil.getGPUs()
+    gpu_load = gpus[0].load * 100 if gpus else "N/A"
+    logging.info(f"CPU: {cpu_percent}%, Memory: {memory_percent}%, GPU: {gpu_load}%")
+
 def stitch_images(images):
     """Stitches a list of images into a single panoramic image using OpenCV."""
     images_cv = [cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR) for image in images]
@@ -45,25 +54,23 @@ def stitch_images(images):
     stitched_image = cv2.cvtColor(stitched_image, cv2.COLOR_BGR2RGB)
     return Image.fromarray(stitched_image)
 
-def lidar_to_image(lidar_data, image_size=(600, 800)):
+def lidar_to_image(lidar_data, vis, image_size=(600, 800)):
     """Converts LiDAR point cloud data to a 2D image using Open3D."""
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(lidar_data[:, :3])
-    vis = o3d.visualization.Visualizer()
-    vis.create_window(visible=False)
+    vis.clear_geometries()
     vis.add_geometry(pcd)
     vis.poll_events()
     vis.update_renderer()
     image = vis.capture_screen_float_buffer(do_render=True)
-    vis.destroy_window()
     image = np.asarray(image)
     image = (image * 255).astype(np.uint8)
     image = cv2.resize(image, image_size)
     return Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
 
-def radar_to_image(radar_data, image_size=(600, 800)):
+def radar_to_image(radar_data, fig, ax, image_size=(600, 800)):
     """Converts radar data to a 2D image."""
-    fig, ax = plt.subplots()
+    ax.clear()
     scatter = ax.scatter(radar_data[:, 0], radar_data[:, 1], c=radar_data[:, 3], cmap='viridis')
     plt.colorbar(scatter)
     ax.set_xlim([-50, 50])
@@ -72,7 +79,6 @@ def radar_to_image(radar_data, image_size=(600, 800)):
     fig.canvas.draw()
     image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
     image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    plt.close(fig)
     return Image.fromarray(cv2.resize(image, image_size))
 
 def cleanup():
@@ -96,12 +102,12 @@ client = carla.Client('localhost', 2000)
 client.set_timeout(10.0)
 world = client.get_world()
 
-# Capture the initial world settings
 current_settings = world.get_settings()
 
 # Set synchronous mode
 settings = world.get_settings()
 settings.synchronous_mode = True 
+settings.fixed_delta_seconds = 0.05  
 world.apply_settings(settings)
 
 # Initialize vehicle
@@ -151,11 +157,18 @@ ensure_dir(image_dir)
 command_log_path = os.path.join(log_dir, 'control_commands.txt')
 
 start_time = time.time()
-duration = 5 * 60  
+duration = 5 * 60  # 5 minutes
 
 try:
+    fig, ax = plt.subplots()  # Create figure once
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(visible=False)
+
     while time.time() - start_time < duration:
         logging.info("Collecting sensor data...")
+        log_resource_usage()
+        
+        # Tick the world to advance the simulation
         world.tick()
 
         # Update the spectator's position
@@ -184,15 +197,15 @@ try:
             stitched_image = stitch_images(images)
             
             # Convert LiDAR and radar data to images
-            lidar_image = lidar_to_image(lidar_data)
-            radar_image = radar_to_image(radar_data)
+            lidar_image = lidar_to_image(lidar_data, vis=vis)
+            radar_image = radar_to_image(radar_data, fig=fig, ax=ax)
             
-            # Freeze simulation
-            settings.no_rendering_mode = True
-            world.apply_settings(settings)
-
             # Get control command from GPT-4V
-            control_command = get_control_from_gpt4([stitched_image, lidar_image, radar_image], vehicle_stats)
+            try:
+                control_command = get_control_from_gpt4([stitched_image, lidar_image, radar_image], vehicle_stats)
+            except Exception as e:
+                logging.error(f"Error getting control command from GPT-4V: {e}")
+                continue
 
             # Save images and log the decision
             timestamp = int(time.time() * 1000)
@@ -202,19 +215,25 @@ try:
             log_control_command(control_command, command_log_path)
 
             # Execute the control command
-            exec(control_command)
-            logging.info(f"Executed control command: {control_command}")
-            
-            # Unfreeze simulation
-            settings.no_rendering_mode = False
-            world.apply_settings(settings)
+            try:
+                exec(control_command)
+                logging.info(f"Executed control command: {control_command}")
+            except Exception as e:
+                logging.error(f"Error executing control command: {e}")
+
         else:
             logging.warning("Waiting for all sensor data to be available...")
 
-        # Wait for 0.5 seconds before capturing the next set of data
-        time.sleep(0.5)
+        # Small delay to prevent busy-waiting
+        time.sleep(0.01)
+
 except Exception as e:
     logging.error(f"An error occurred: {e}")
 finally:
     cleanup()
+    plt.close(fig)  # Close the matplotlib figure
+    vis.destroy_window()  # Destroy the Open3D visualizer
     logging.info("Cleanup completed.")
+
+# Restore original settings
+world.apply_settings(current_settings)
