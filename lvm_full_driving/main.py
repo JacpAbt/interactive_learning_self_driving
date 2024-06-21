@@ -14,10 +14,28 @@ from sensors.gps import GPSSensor
 from utils.data_processing import save_image, log_control_command, ensure_dir
 from utils.visualization import show_image, plot_lidar, plot_radar
 import random
+from dotenv import load_dotenv
+import logging
+import signal
+
+load_dotenv()  # Load environment variables from .env file
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Handle signals for graceful shutdown
+def signal_handler(sig, frame):
+    logging.info('Received signal to terminate. Cleaning up...')
+    cleanup()
+    exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 def stitch_images(images):
     """Stitches a list of images into a single panoramic image using OpenCV."""
     images_cv = [cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR) for image in images]
+    
     stitcher = cv2.Stitcher_create()
     status, stitched_image = stitcher.stitch(images_cv)
     
@@ -57,22 +75,44 @@ def radar_to_image(radar_data, image_size=(600, 800)):
     plt.close(fig)
     return Image.fromarray(cv2.resize(image, image_size))
 
+def cleanup():
+    """Cleanup all actors and sensors."""
+    try:
+        for camera in cameras:
+            camera.sensor.destroy()
+        lidar.sensor.destroy()
+        radar.sensor.destroy()
+        vehicle.destroy()
+    except Exception as e:
+        logging.error(f"Error during cleanup: {e}")
+
+def update_spectator_position(vehicle, spectator):
+    """Update the spectator's position to follow the vehicle."""
+    transform = vehicle.get_transform()
+    spectator.set_transform(carla.Transform(transform.location + carla.Location(z=50), carla.Rotation(pitch=-90)))
+
 # Initialize CARLA client and world
 client = carla.Client('localhost', 2000)
 client.set_timeout(10.0)
 world = client.get_world()
 
+# Capture the initial world settings
+current_settings = world.get_settings()
+
+# Set synchronous mode
+settings = world.get_settings()
+settings.synchronous_mode = True 
+world.apply_settings(settings)
+
 # Initialize vehicle
 blueprint_library = world.get_blueprint_library()
-vehicle_bp = ego_bp = world.get_blueprint_library().find('vehicle.tesla.model3')
+vehicle_bp = blueprint_library.find('vehicle.tesla.model3')
 spawn_points = world.get_map().get_spawn_points()
-ego_bp.set_attribute('role_name', 'hero')
-vehicle = world.spawn_actor(ego_bp, random.choice(spawn_points))
+vehicle_bp.set_attribute('role_name', 'hero')
+vehicle = world.spawn_actor(vehicle_bp, random.choice(spawn_points))
 
-# Teleport to the vehicle
+# Initialize the spectator
 spectator = world.get_spectator()
-transform = vehicle.get_transform()
-spectator.set_transform(carla.Transform(transform.location + carla.Location(z=50), carla.Rotation(pitch=-90)))
 
 # Initialize sensors
 camera_transforms = [
@@ -83,8 +123,11 @@ camera_transforms = [
     carla.Transform(carla.Location(x=1.5, y=-0.75, z=2.4), carla.Rotation(pitch=0, yaw=-45, roll=0)),  # Front-left camera
     carla.Transform(carla.Location(x=1.5, y=0.75, z=2.4), carla.Rotation(pitch=0, yaw=45, roll=0)),   # Front-right camera
     carla.Transform(carla.Location(x=-1.5, y=-0.75, z=2.4), carla.Rotation(pitch=0, yaw=-135, roll=0)),  # Rear-left camera
-    carla.Transform(carla.Location(x=-1.5, y=0.75, z=2.4), carla.Rotation(pitch=0, yaw=135, roll=0))    # Rear-right camera
+    carla.Transform(carla.Location(x=-1.5, y=0.75, z=2.4), carla.Rotation(pitch=0, yaw=135, roll=0)),    # Rear-right camera
+    carla.Transform(carla.Location(x=1.5, z=2.4), carla.Rotation(pitch=0, yaw=10, roll=0)),     # Front additional camera
+    carla.Transform(carla.Location(x=-1.5, z=2.4), carla.Rotation(pitch=0, yaw=170, roll=0))   # Rear additional camera
 ]
+
 cameras = [CameraSensor(vehicle, transform) for transform in camera_transforms]
 for camera in cameras:
     camera.listen()
@@ -108,13 +151,16 @@ ensure_dir(image_dir)
 command_log_path = os.path.join(log_dir, 'control_commands.txt')
 
 start_time = time.time()
-duration = 5 * 60  # Run for 5 minutes
-
-# Fetch current world settings
-current_settings = world.get_settings()
+duration = 5 * 60  
 
 try:
     while time.time() - start_time < duration:
+        logging.info("Collecting sensor data...")
+        world.tick()
+
+        # Update the spectator's position
+        update_spectator_position(vehicle, spectator)
+
         # Get sensor data
         images = [camera.get_image() for camera in cameras]
         lidar_data = lidar.get_point_cloud()
@@ -142,19 +188,8 @@ try:
             radar_image = radar_to_image(radar_data)
             
             # Freeze simulation
-            world.apply_settings(carla.WorldSettings(
-                synchronous_mode=current_settings.synchronous_mode,
-                no_rendering_mode=True,
-                fixed_delta_seconds=0.05,
-                substepping=current_settings.substepping,
-                max_substep_delta_time=current_settings.max_substep_delta_time,
-                max_substeps=current_settings.max_substeps,
-                max_culling_distance=current_settings.max_culling_distance,
-                deterministic_ragdolls=current_settings.deterministic_ragdolls,
-                tile_stream_distance=current_settings.tile_stream_distance,
-                actor_active_distance=current_settings.actor_active_distance,
-                spectator_as_ego=current_settings.spectator_as_ego
-            ))
+            settings.no_rendering_mode = True
+            world.apply_settings(settings)
 
             # Get control command from GPT-4V
             control_command = get_control_from_gpt4([stitched_image, lidar_image, radar_image], vehicle_stats)
@@ -168,16 +203,18 @@ try:
 
             # Execute the control command
             exec(control_command)
+            logging.info(f"Executed control command: {control_command}")
             
             # Unfreeze simulation
-            world.apply_settings(current_settings)
+            settings.no_rendering_mode = False
+            world.apply_settings(settings)
+        else:
+            logging.warning("Waiting for all sensor data to be available...")
 
         # Wait for 0.5 seconds before capturing the next set of data
         time.sleep(0.5)
-
+except Exception as e:
+    logging.error(f"An error occurred: {e}")
 finally:
-    for camera in cameras:
-        camera.destroy()
-    lidar.destroy()
-    radar.destroy()
-    vehicle.destroy()
+    cleanup()
+    logging.info("Cleanup completed.")

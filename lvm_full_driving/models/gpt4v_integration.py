@@ -3,7 +3,9 @@ import base64
 from PIL import Image
 from io import BytesIO
 import numpy as np
+from dotenv import load_dotenv
 
+load_dotenv()
 client = OpenAI()
 def encode_image_base64(image):
     """Encodes a PIL image to a base64 string."""
@@ -26,6 +28,7 @@ def get_control_from_gpt4(images, vehicle_stats):
                     "text": f"""
                         You are an autonomous driving system built within the CARLA open source program.
                         Analyze the driving environment and provide the exact CARLA vehicle control command. 
+                        You'll recieve as input a stitched image of cameras around the car, lidar, and radar, and the stats of the car in the moment of this photo.
                         The response should be a single line of Python code to control the vehicle, like 'vehicle.apply_control(carla.VehicleControl(throttle=0.5, steer=0.0, brake=0.0))'. 
                         Do not write 'python' at the beginning, do not put the command between ' ', just the pure python code.
                         These are the stats of the car in the moment of this photo: {stats_text}
